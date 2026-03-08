@@ -16,13 +16,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 /* ═══════════════════════════════════════════════════════
    MAIN ORCHESTRATOR
    ═══════════════════════════════════════════════════════ */
-async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate }) {
+async function handleCaptureMultiple({
+  tabId,
+  url,
+  widths,
+  fullPage,
+  annotate,
+}) {
   const total = widths.length;
-  console.log("[RS] Starting capture for", total, "widths:", widths, "tabId:", tabId);
+  console.log(
+    "[RS] Starting capture for",
+    total,
+    "widths:",
+    widths,
+    "tabId:",
+    tabId,
+  );
 
   // Attach debugger to the tab
   const debugTarget = { tabId };
-  
+
   try {
     await chrome.debugger.attach(debugTarget, "1.3");
     console.log("[RS] Debugger attached");
@@ -52,7 +65,12 @@ async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate })
         } else {
           dataUrl = await captureViewportCDP(debugTarget, width);
         }
-        console.log("[RS] Captured", width, "- data length:", dataUrl?.length || 0);
+        console.log(
+          "[RS] Captured",
+          width,
+          "- data length:",
+          dataUrl?.length || 0,
+        );
       } catch (err) {
         console.error("[RS] Capture failed for", width, ":", err);
         notifyProgress(i + 1, total, `Failed at ${width}px`);
@@ -74,7 +92,7 @@ async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate })
 
         await chrome.tabs.create({
           url: chrome.runtime.getURL(
-            `annotation/annotation.html?key=${encodeURIComponent(key)}&width=${width}`
+            `annotation/annotation.html?key=${encodeURIComponent(key)}&width=${width}`,
           ),
           active: true,
         });
@@ -86,7 +104,6 @@ async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate })
 
     // Reset emulation
     await sendDebugCommand(debugTarget, "Emulation.clearDeviceMetricsOverride");
-    
   } finally {
     // Always detach debugger
     try {
@@ -127,107 +144,170 @@ async function captureViewportCDP(debugTarget, width) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   FULL-PAGE CAPTURE using CDP
+   FULL-PAGE CAPTURE using CDP - scroll and stitch
    ═══════════════════════════════════════════════════════ */
 async function captureFullPageCDP(debugTarget, width) {
   console.log("[RS] captureFullPageCDP for width:", width);
 
-  // Set viewport width first
+  const viewportHeight = 900;
+
+  // Set viewport size
   await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
     width: width,
-    height: 800,
+    height: viewportHeight,
     deviceScaleFactor: 1,
     mobile: width < 768,
   });
 
-  await sleep(600); // Let page reflow
+  await sleep(800); // Let page reflow
 
-  // Get page metrics for full page dimensions
-  const layoutMetrics = await sendDebugCommand(debugTarget, "Page.getLayoutMetrics");
-  const contentSize = layoutMetrics.contentSize || layoutMetrics.cssContentSize;
-  
-  const pageWidth = Math.ceil(contentSize.width);
-  const pageHeight = Math.ceil(contentSize.height);
-  
-  console.log("[RS] Full page dimensions:", pageWidth, "x", pageHeight);
+  // Get initial page height
+  let pageHeight = await getPageHeight(debugTarget);
+  console.log("[RS] Initial page height:", pageHeight);
 
-  // Scroll through the page to trigger lazy loading
-  const viewportHeight = 800;
+  // First pass: scroll through entire page slowly to trigger ALL lazy loading
+  const scrollStep = Math.floor(viewportHeight * 0.5); // 50% overlap
   let scrollY = 0;
+
   while (scrollY < pageHeight) {
     await sendDebugCommand(debugTarget, "Runtime.evaluate", {
-      expression: `window.scrollTo(0, ${scrollY})`,
+      expression: `window.scrollTo({ top: ${scrollY}, behavior: 'instant' })`,
     });
-    await sleep(150);
-    scrollY += viewportHeight;
+    await sleep(400); // Wait for lazy content to load
+
+    // Re-check page height as it may grow with lazy content
+    const newHeight = await getPageHeight(debugTarget);
+    if (newHeight > pageHeight) {
+      console.log("[RS] Page grew from", pageHeight, "to", newHeight);
+      pageHeight = newHeight;
+    }
+
+    scrollY += scrollStep;
   }
-  
-  // Scroll back to top
+
+  // Scroll to bottom and wait
   await sendDebugCommand(debugTarget, "Runtime.evaluate", {
-    expression: "window.scrollTo(0, 0)",
+    expression: `window.scrollTo({ top: ${pageHeight}, behavior: 'instant' })`,
   });
-  await sleep(300);
+  await sleep(500);
 
-  // Re-measure after lazy content loaded
-  const metricsAfter = await sendDebugCommand(debugTarget, "Page.getLayoutMetrics");
-  const finalContent = metricsAfter.contentSize || metricsAfter.cssContentSize;
-  const finalHeight = Math.ceil(finalContent.height);
-  
-  console.log("[RS] Final page height after scroll:", finalHeight);
+  // Final height check
+  pageHeight = await getPageHeight(debugTarget);
+  console.log("[RS] Final page height:", pageHeight);
 
-  // Limit to Chrome's max texture size
-  const maxHeight = 16384;
-  const captureHeight = Math.min(finalHeight, maxHeight);
-
-  // Disable fixed/sticky elements to avoid duplicates in capture
+  // Hide fixed/sticky elements temporarily
   await sendDebugCommand(debugTarget, "Runtime.evaluate", {
     expression: `
       (function() {
-        const style = document.createElement('style');
-        style.id = '__rs_fullpage_fix__';
-        style.textContent = '* { position: static !important; }';
+        window.__rs_hidden = [];
         document.querySelectorAll('*').forEach(el => {
           const cs = getComputedStyle(el);
           if (cs.position === 'fixed' || cs.position === 'sticky') {
-            el.dataset.rsOrigPos = el.style.position;
-            el.style.setProperty('position', 'relative', 'important');
+            window.__rs_hidden.push({ el, display: el.style.display });
+            el.style.display = 'none';
           }
         });
-        document.head.appendChild(style);
       })()
     `,
   });
-  await sleep(200);
 
-  // Capture full page screenshot using captureBeyondViewport
-  const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
-    format: "png",
-    captureBeyondViewport: true,
-    fromSurface: true,
-    clip: {
-      x: 0,
-      y: 0,
-      width: width,
-      height: captureHeight,
-      scale: 1,
-    },
-  });
+  // Capture strips and stitch
+  const strips = [];
+  const stripHeight = viewportHeight;
+  const maxHeight = 16000;
+  const captureHeight = Math.min(pageHeight, maxHeight);
+
+  scrollY = 0;
+  while (scrollY < captureHeight) {
+    await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+      expression: `window.scrollTo({ top: ${scrollY}, behavior: 'instant' })`,
+    });
+    await sleep(200);
+
+    const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: false,
+    });
+
+    const remainingHeight = captureHeight - scrollY;
+    const thisStripHeight = Math.min(stripHeight, remainingHeight);
+
+    strips.push({
+      data: result.data,
+      y: scrollY,
+      height: thisStripHeight,
+    });
+
+    console.log("[RS] Captured strip at y:", scrollY, "height:", thisStripHeight);
+
+    scrollY += stripHeight;
+  }
 
   // Restore fixed/sticky elements
   await sendDebugCommand(debugTarget, "Runtime.evaluate", {
     expression: `
       (function() {
-        document.querySelectorAll('[data-rs-orig-pos]').forEach(el => {
-          el.style.position = el.dataset.rsOrigPos || '';
-          delete el.dataset.rsOrigPos;
-        });
-        const fix = document.getElementById('__rs_fullpage_fix__');
-        if (fix) fix.remove();
+        if (window.__rs_hidden) {
+          window.__rs_hidden.forEach(({ el, display }) => {
+            el.style.display = display || '';
+          });
+          delete window.__rs_hidden;
+        }
       })()
     `,
   });
 
-  return "data:image/png;base64," + result.data;
+  // Scroll back to top
+  await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+    expression: "window.scrollTo({ top: 0, behavior: 'instant' })",
+  });
+
+  // Stitch strips together
+  if (strips.length === 1) {
+    return "data:image/png;base64," + strips[0].data;
+  }
+
+  return await stitchStrips(strips, width, captureHeight, viewportHeight);
+}
+
+async function getPageHeight(debugTarget) {
+  const result = await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+    expression:
+      "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)",
+    returnByValue: true,
+  });
+  return result.result.value;
+}
+
+async function stitchStrips(strips, width, totalHeight, viewportHeight) {
+  // Create a canvas to stitch
+  const canvas = new OffscreenCanvas(width, totalHeight);
+  const ctx = canvas.getContext("2d");
+
+  for (const strip of strips) {
+    const blob = base64ToBlob(strip.data, "image/png");
+    const bmp = await createImageBitmap(blob);
+
+    // Calculate how much of this strip to use
+    const srcHeight = Math.min(bmp.height, strip.height);
+    const destY = strip.y;
+
+    ctx.drawImage(bmp, 0, 0, bmp.width, srcHeight, 0, destY, width, srcHeight);
+
+    bmp.close();
+  }
+
+  const resultBlob = await canvas.convertToBlob({ type: "image/png" });
+  return blobToDataUrl(resultBlob);
+}
+
+function base64ToBlob(base64, mimeType) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: mimeType });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -275,4 +355,12 @@ function notifyProgress(current, total, label) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
 }
