@@ -338,41 +338,52 @@ function drawBlurPreview(ctx, x1, y1, x2, y2) {
 }
 
 function drawBlur(ctx, x1, y1, x2, y2) {
-  const rx = Math.min(x1, x2),
-    ry = Math.min(y1, y2);
-  const rw = Math.abs(x2 - x1),
-    rh = Math.abs(y2 - y1);
+  const rx = Math.round(Math.min(x1, x2)),
+    ry = Math.round(Math.min(y1, y2));
+  const rw = Math.round(Math.abs(x2 - x1)),
+    rh = Math.round(Math.abs(y2 - y1));
   if (rw < 2 || rh < 2) return;
-  const imageData = ctx.getImageData(rx, ry, rw, rh);
-  const bs = 10;
+  
+  // Create temp canvas from base image to get clean pixel data
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = baseImage.width;
+  tempCanvas.height = baseImage.height;
+  const tempCtx = tempCanvas.getContext("2d");
+  tempCtx.drawImage(baseImage, 0, 0);
+  
+  // Get image data from the clean base image
+  const imageData = tempCtx.getImageData(rx, ry, rw, rh);
+  const data = imageData.data;
+  const bs = 12; // Block size for pixelation
+  
   for (let by = 0; by < rh; by += bs) {
     for (let bx = 0; bx < rw; bx += bs) {
-      const idx = (by * rw + bx) * 4;
-      const r = imageData.data[idx],
-        g = imageData.data[idx + 1],
-        b = imageData.data[idx + 2];
+      // Average color in this block
+      let rSum = 0, gSum = 0, bSum = 0, count = 0;
       for (let dy = 0; dy < bs && by + dy < rh; dy++) {
         for (let dx = 0; dx < bs && bx + dx < rw; dx++) {
           const i = ((by + dy) * rw + (bx + dx)) * 4;
-          imageData.data[i] = r;
-          imageData.data[i + 1] = g;
-          imageData.data[i + 2] = b;
+          rSum += data[i];
+          gSum += data[i + 1];
+          bSum += data[i + 2];
+          count++;
+        }
+      }
+      const avgR = Math.round(rSum / count);
+      const avgG = Math.round(gSum / count);
+      const avgB = Math.round(bSum / count);
+      
+      // Fill block with average color
+      for (let dy = 0; dy < bs && by + dy < rh; dy++) {
+        for (let dx = 0; dx < bs && bx + dx < rw; dx++) {
+          const i = ((by + dy) * rw + (bx + dx)) * 4;
+          data[i] = avgR;
+          data[i + 1] = avgG;
+          data[i + 2] = avgB;
         }
       }
     }
   }
+  
   ctx.putImageData(imageData, rx, ry);
-}
-
-function drawBlurPreview(ctx, x1, y1, x2, y2) {
-  ctx.strokeStyle = "rgba(255,255,255,0.5)";
-  ctx.lineWidth = 1;
-  ctx.setLineDash([5, 5]);
-  ctx.strokeRect(
-    Math.min(x1, x2),
-    Math.min(y1, y2),
-    Math.abs(x2 - x1),
-    Math.abs(y2 - y1),
-  );
-  ctx.setLineDash([]);
 }
