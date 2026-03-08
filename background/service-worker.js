@@ -132,7 +132,7 @@ async function captureViewportCDP(debugTarget, width) {
 async function captureFullPageCDP(debugTarget, width) {
   console.log("[RS] captureFullPageCDP for width:", width);
 
-  // Set viewport width
+  // Set viewport width first
   await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
     width: width,
     height: 800,
@@ -140,7 +140,7 @@ async function captureFullPageCDP(debugTarget, width) {
     mobile: width < 768,
   });
 
-  await sleep(500); // Let page reflow
+  await sleep(600); // Let page reflow
 
   // Get page metrics for full page dimensions
   const layoutMetrics = await sendDebugCommand(debugTarget, "Page.getLayoutMetrics");
@@ -151,23 +151,59 @@ async function captureFullPageCDP(debugTarget, width) {
   
   console.log("[RS] Full page dimensions:", pageWidth, "x", pageHeight);
 
-  // Set viewport to full page size (with limits)
-  const maxHeight = 16384; // Chrome limit
-  const captureHeight = Math.min(pageHeight, maxHeight);
-
-  await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
-    width: width,
-    height: captureHeight,
-    deviceScaleFactor: 1,
-    mobile: width < 768,
+  // Scroll through the page to trigger lazy loading
+  const viewportHeight = 800;
+  let scrollY = 0;
+  while (scrollY < pageHeight) {
+    await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+      expression: `window.scrollTo(0, ${scrollY})`,
+    });
+    await sleep(150);
+    scrollY += viewportHeight;
+  }
+  
+  // Scroll back to top
+  await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+    expression: "window.scrollTo(0, 0)",
   });
-
   await sleep(300);
 
-  // Capture full page screenshot
+  // Re-measure after lazy content loaded
+  const metricsAfter = await sendDebugCommand(debugTarget, "Page.getLayoutMetrics");
+  const finalContent = metricsAfter.contentSize || metricsAfter.cssContentSize;
+  const finalHeight = Math.ceil(finalContent.height);
+  
+  console.log("[RS] Final page height after scroll:", finalHeight);
+
+  // Limit to Chrome's max texture size
+  const maxHeight = 16384;
+  const captureHeight = Math.min(finalHeight, maxHeight);
+
+  // Disable fixed/sticky elements to avoid duplicates in capture
+  await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+    expression: `
+      (function() {
+        const style = document.createElement('style');
+        style.id = '__rs_fullpage_fix__';
+        style.textContent = '* { position: static !important; }';
+        document.querySelectorAll('*').forEach(el => {
+          const cs = getComputedStyle(el);
+          if (cs.position === 'fixed' || cs.position === 'sticky') {
+            el.dataset.rsOrigPos = el.style.position;
+            el.style.setProperty('position', 'relative', 'important');
+          }
+        });
+        document.head.appendChild(style);
+      })()
+    `,
+  });
+  await sleep(200);
+
+  // Capture full page screenshot using captureBeyondViewport
   const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
     format: "png",
     captureBeyondViewport: true,
+    fromSurface: true,
     clip: {
       x: 0,
       y: 0,
@@ -175,6 +211,20 @@ async function captureFullPageCDP(debugTarget, width) {
       height: captureHeight,
       scale: 1,
     },
+  });
+
+  // Restore fixed/sticky elements
+  await sendDebugCommand(debugTarget, "Runtime.evaluate", {
+    expression: `
+      (function() {
+        document.querySelectorAll('[data-rs-orig-pos]').forEach(el => {
+          el.style.position = el.dataset.rsOrigPos || '';
+          delete el.dataset.rsOrigPos;
+        });
+        const fix = document.getElementById('__rs_fullpage_fix__');
+        if (fix) fix.remove();
+      })()
+    `,
   });
 
   return "data:image/png;base64," + result.data;

@@ -169,7 +169,7 @@ overlayCanvas.addEventListener("mousedown", (e) => {
 
 overlayCanvas.addEventListener("mousemove", (e) => {
   if (!isDrawing) return;
-  
+
   const pos = getPos(e);
   if (currentTool === "pen") {
     currentPath.push({ x: pos.x, y: pos.y });
