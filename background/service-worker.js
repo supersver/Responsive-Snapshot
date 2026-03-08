@@ -4,7 +4,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'captureMultiple') {
     handleCaptureMultiple(msg)
       .then(sendResponse)
-      .catch(err => sendResponse({ error: err.message }));
+      .catch(err => {
+        console.error('[RS] Capture error:', err);
+        sendResponse({ error: err.message });
+      });
     return true; // async response
   }
 });
@@ -14,6 +17,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
    ═══════════════════════════════════════════════════════ */
 async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate }) {
   const total = widths.length;
+  console.log('[RS] Starting capture for', total, 'widths:', widths);
 
   for (let i = 0; i < total; i++) {
     const width = widths[i];
@@ -26,11 +30,14 @@ async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate })
       } else {
         dataUrl = await captureViewport(url, width);
       }
+      console.log('[RS] Captured', width, '- data length:', dataUrl?.length || 0);
     } catch (err) {
+      console.error('[RS] Capture failed for', width, ':', err);
       // Fallback to viewport capture if full-page fails
       try {
         dataUrl = await captureViewport(url, width);
       } catch (fallbackErr) {
+        console.error('[RS] Fallback also failed:', fallbackErr);
         notifyProgress(i + 1, total, `Failed at ${width}px`);
         continue;
       }
@@ -38,17 +45,26 @@ async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate })
 
     notifyProgress(i + 1, total, `Done ${width}px`);
 
-    if (annotate) {
+    if (annotate && dataUrl) {
       // Store image in session storage and open annotation tab
       const key = `rs_img_${Date.now()}_${width}`;
-      await chrome.storage.session.set({ [key]: { dataUrl, width, url } });
-      chrome.tabs.create({
+      try {
+        await chrome.storage.session.set({ [key]: { dataUrl, width, url } });
+        console.log('[RS] Stored in session:', key);
+      } catch (storageErr) {
+        console.error('[RS] Storage failed:', storageErr);
+        // Fallback: download instead
+        downloadImage(dataUrl, url, width);
+        continue;
+      }
+      
+      await chrome.tabs.create({
         url: chrome.runtime.getURL(`annotation/annotation.html?key=${encodeURIComponent(key)}&width=${width}`),
         active: true,
       });
       // Stagger multiple tabs slightly
-      if (i < total - 1) await sleep(300);
-    } else {
+      if (i < total - 1) await sleep(400);
+    } else if (dataUrl) {
       downloadImage(dataUrl, url, width);
     }
   }
@@ -66,14 +82,18 @@ async function captureViewport(url, width) {
     width: width + 16,   // +16 for scrollbar headroom
     height: 900,
     state: 'normal',
-    focused: false,
+    focused: true,  // Must focus to capture
   });
 
   try {
     const tab = win.tabs[0];
     // Wait for the tab to fully load
     await waitForTabLoad(tab.id);
-    await sleep(600);
+    await sleep(800);  // Extra time for render
+
+    // Focus the window again before capture
+    await chrome.windows.update(win.id, { focused: true });
+    await sleep(200);
 
     const dataUrl = await chrome.tabs.captureVisibleTab(win.id, { format: 'png' });
     return dataUrl;
@@ -91,13 +111,17 @@ async function captureFullPage(url, width) {
     width: width + 16,
     height: 900,
     state: 'normal',
-    focused: false,
+    focused: true,  // Must focus to capture
   });
 
   try {
     const tab = win.tabs[0];
     await waitForTabLoad(tab.id);
-    await sleep(600);
+    await sleep(800);
+
+    // Focus the window before capture
+    await chrome.windows.update(win.id, { focused: true });
+    await sleep(200);
 
     // Get page metrics
     const [{ result: metrics }] = await chrome.scripting.executeScript({

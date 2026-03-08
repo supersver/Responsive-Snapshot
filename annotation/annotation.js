@@ -25,22 +25,56 @@ baseImage.onload = () => {
   mainCanvas.height = overlayCanvas.height = baseImage.height;
   redraw();
   if (capturedWidth) widthInfo.textContent = capturedWidth + 'px viewport';
+  // Hide loading message
+  const loadingMsg = document.getElementById('loadingMessage');
+  if (loadingMsg) loadingMsg.remove();
+};
+
+baseImage.onerror = () => {
+  showError('Failed to load screenshot image');
 };
 
 async function loadImage() {
+  console.log('[RS Annotation] Loading image, key:', storageKey);
+  
   if (storageKey) {
     try {
       const result = await chrome.storage.session.get(storageKey);
+      console.log('[RS Annotation] Storage result:', result ? 'found' : 'not found');
       const entry = result[storageKey];
       if (entry && entry.dataUrl) {
+        console.log('[RS Annotation] Setting image src, data length:', entry.dataUrl.length);
         baseImage.src = entry.dataUrl;
         return;
+      } else {
+        showError('Screenshot not found in storage. The capture may have failed.');
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error('[RS Annotation] Storage error:', e);
+      showError('Failed to access storage: ' + e.message);
+    }
+  } else {
+    const imgSrc = params.get('img');
+    if (imgSrc) {
+      baseImage.src = imgSrc;
+    } else {
+      showError('No image source provided');
+    }
   }
-  const imgSrc = params.get('img');
-  if (imgSrc) baseImage.src = imgSrc;
 }
+
+function showError(msg) {
+  const container = document.querySelector('.canvas-container') || document.body;
+  const existing = document.getElementById('loadingMessage');
+  if (existing) existing.remove();
+  
+  const errDiv = document.createElement('div');
+  errDiv.id = 'loadingMessage';
+  errDiv.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#ff6b6b;font-size:16px;text-align:center;padding:20px;background:#1a1a2e;border-radius:8px;border:1px solid #ff6b6b;max-width:400px;';
+  errDiv.innerHTML = `<strong>Error</strong><br><br>${msg}<br><br><small>Check browser console (F12) for details</small>`;
+  container.appendChild(errDiv);
+}
+
 loadImage();
 
 /* Tool Selection */
