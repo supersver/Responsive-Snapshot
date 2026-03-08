@@ -144,6 +144,17 @@ captureBtn.addEventListener('click', async () => {
     return;
   }
 
+  // Get current tab info first
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  
+  // Check for restricted URLs
+  const restrictedPrefixes = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'file://'];
+  const isRestricted = restrictedPrefixes.some(prefix => tab.url.startsWith(prefix));
+  if (isRestricted) {
+    showStatus('Cannot capture browser pages. Navigate to a website first.', 'error');
+    return;
+  }
+
   captureBtn.disabled = true;
   captureText.textContent = 'Capturing…';
   captureSpinner.classList.remove('hidden');
@@ -151,7 +162,6 @@ captureBtn.addEventListener('click', async () => {
   setProgress(0, `0 / ${widths.length}`);
 
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const response = await chrome.runtime.sendMessage({
       action: 'captureMultiple',
       tabId: tab.id,

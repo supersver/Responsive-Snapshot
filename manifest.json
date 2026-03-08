@@ -1,17 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Responsive Snapshot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Capture screenshots of any page at multiple device widths with one click. Includes presets, full-page stitching, and annotation.",
   "permissions": [
     "activeTab",
     "scripting",
     "downloads",
-    "windows",
     "tabs",
-    "storage"
+    "storage",
+    "debugger"
   ],
-  "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {

@@ -1,4 +1,5 @@
 /* ── Responsive Snapshot — Background Service Worker ── */
+/* Uses Chrome DevTools Protocol for reliable responsive capture */
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "captureMultiple") {
@@ -15,70 +16,84 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 /* ═══════════════════════════════════════════════════════
    MAIN ORCHESTRATOR
    ═══════════════════════════════════════════════════════ */
-async function handleCaptureMultiple({
-  tabId,
-  url,
-  widths,
-  fullPage,
-  annotate,
-}) {
+async function handleCaptureMultiple({ tabId, url, widths, fullPage, annotate }) {
   const total = widths.length;
-  console.log("[RS] Starting capture for", total, "widths:", widths);
+  console.log("[RS] Starting capture for", total, "widths:", widths, "tabId:", tabId);
 
-  for (let i = 0; i < total; i++) {
-    const width = widths[i];
-    notifyProgress(i, total, `Preparing ${width}px…`);
+  // Attach debugger to the tab
+  const debugTarget = { tabId };
+  
+  try {
+    await chrome.debugger.attach(debugTarget, "1.3");
+    console.log("[RS] Debugger attached");
+  } catch (err) {
+    console.error("[RS] Failed to attach debugger:", err);
+    throw new Error("Failed to attach debugger. Try reloading the page.");
+  }
 
-    let dataUrl;
-    try {
-      if (fullPage) {
-        dataUrl = await captureFullPage(url, width);
-      } else {
-        dataUrl = await captureViewport(url, width);
-      }
-      console.log(
-        "[RS] Captured",
-        width,
-        "- data length:",
-        dataUrl?.length || 0,
-      );
-    } catch (err) {
-      console.error("[RS] Capture failed for", width, ":", err);
-      // Fallback to viewport capture if full-page fails
+  try {
+    // Enable necessary domains
+    await sendDebugCommand(debugTarget, "Page.enable");
+    await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
+      width: 0,
+      height: 0,
+      deviceScaleFactor: 0,
+      mobile: false,
+    });
+
+    for (let i = 0; i < total; i++) {
+      const width = widths[i];
+      notifyProgress(i, total, `Capturing ${width}px…`);
+
+      let dataUrl;
       try {
-        dataUrl = await captureViewport(url, width);
-      } catch (fallbackErr) {
-        console.error("[RS] Fallback also failed:", fallbackErr);
+        if (fullPage) {
+          dataUrl = await captureFullPageCDP(debugTarget, width);
+        } else {
+          dataUrl = await captureViewportCDP(debugTarget, width);
+        }
+        console.log("[RS] Captured", width, "- data length:", dataUrl?.length || 0);
+      } catch (err) {
+        console.error("[RS] Capture failed for", width, ":", err);
         notifyProgress(i + 1, total, `Failed at ${width}px`);
         continue;
       }
+
+      notifyProgress(i + 1, total, `Done ${width}px`);
+
+      if (annotate && dataUrl) {
+        const key = `rs_img_${Date.now()}_${width}`;
+        try {
+          await chrome.storage.session.set({ [key]: { dataUrl, width, url } });
+          console.log("[RS] Stored in session:", key);
+        } catch (storageErr) {
+          console.error("[RS] Storage failed:", storageErr);
+          downloadImage(dataUrl, url, width);
+          continue;
+        }
+
+        await chrome.tabs.create({
+          url: chrome.runtime.getURL(
+            `annotation/annotation.html?key=${encodeURIComponent(key)}&width=${width}`
+          ),
+          active: true,
+        });
+        if (i < total - 1) await sleep(400);
+      } else if (dataUrl) {
+        downloadImage(dataUrl, url, width);
+      }
     }
 
-    notifyProgress(i + 1, total, `Done ${width}px`);
-
-    if (annotate && dataUrl) {
-      // Store image in session storage and open annotation tab
-      const key = `rs_img_${Date.now()}_${width}`;
-      try {
-        await chrome.storage.session.set({ [key]: { dataUrl, width, url } });
-        console.log("[RS] Stored in session:", key);
-      } catch (storageErr) {
-        console.error("[RS] Storage failed:", storageErr);
-        // Fallback: download instead
-        downloadImage(dataUrl, url, width);
-        continue;
-      }
-
-      await chrome.tabs.create({
-        url: chrome.runtime.getURL(
-          `annotation/annotation.html?key=${encodeURIComponent(key)}&width=${width}`,
-        ),
-        active: true,
-      });
-      // Stagger multiple tabs slightly
-      if (i < total - 1) await sleep(400);
-    } else if (dataUrl) {
-      downloadImage(dataUrl, url, width);
+    // Reset emulation
+    await sendDebugCommand(debugTarget, "Emulation.clearDeviceMetricsOverride");
+    
+  } finally {
+    // Always detach debugger
+    try {
+      await chrome.debugger.detach(debugTarget);
+      console.log("[RS] Debugger detached");
+    } catch (e) {
+      console.log("[RS] Debugger already detached");
     }
   }
 
@@ -87,267 +102,102 @@ async function handleCaptureMultiple({
 }
 
 /* ═══════════════════════════════════════════════════════
-   VIEWPORT CAPTURE — open offscreen window, capture, close
+   VIEWPORT CAPTURE using CDP
    ═══════════════════════════════════════════════════════ */
-async function captureViewport(url, width) {
-  console.log("[RS] captureViewport starting for width:", width);
-  
-  const win = await chrome.windows.create({
-    url,
-    width: width + 16, // +16 for scrollbar headroom
-    height: 900,
-    state: "normal",
-    focused: true, // Must focus to capture
+async function captureViewportCDP(debugTarget, width) {
+  console.log("[RS] captureViewportCDP for width:", width);
+
+  // Set viewport size
+  await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
+    width: width,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: width < 768,
   });
-  console.log("[RS] Window created:", win.id);
 
-  try {
-    const tab = win.tabs[0];
-    console.log("[RS] Tab ID:", tab.id);
-    
-    // Wait for the tab to fully load
-    await waitForTabLoad(tab.id);
-    console.log("[RS] Tab loaded");
-    await sleep(1000); // Extra time for render
+  await sleep(500); // Let page reflow
 
-    // Focus the window again before capture
-    await chrome.windows.update(win.id, { focused: true });
-    await sleep(300);
-    
-    console.log("[RS] Attempting captureVisibleTab...");
-    const dataUrl = await chrome.tabs.captureVisibleTab(win.id, {
-      format: "png",
-    });
-    console.log("[RS] Capture successful, dataUrl length:", dataUrl?.length);
-    return dataUrl;
-  } catch (err) {
-    console.error("[RS] captureViewport error:", err);
-    throw err;
-  } finally {
-    console.log("[RS] Removing window:", win.id);
-    await chrome.windows.remove(win.id).catch(() => {});
-  }
+  // Capture screenshot
+  const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: false,
+  });
+
+  return "data:image/png;base64," + result.data;
 }
 
 /* ═══════════════════════════════════════════════════════
-   FULL-PAGE CAPTURE — scroll & stitch in offscreen window
+   FULL-PAGE CAPTURE using CDP
    ═══════════════════════════════════════════════════════ */
-async function captureFullPage(url, width) {
-  console.log("[RS] captureFullPage starting for width:", width);
-  
-  const win = await chrome.windows.create({
-    url,
-    width: width + 16,
-    height: 900,
-    state: "normal",
-    focused: true, // Must focus to capture
+async function captureFullPageCDP(debugTarget, width) {
+  console.log("[RS] captureFullPageCDP for width:", width);
+
+  // Set viewport width
+  await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
+    width: width,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: width < 768,
   });
-  console.log("[RS] Full-page window created:", win.id);
 
-  try {
-    const tab = win.tabs[0];
-    await waitForTabLoad(tab.id);
-    console.log("[RS] Full-page tab loaded");
-    await sleep(1000);
+  await sleep(500); // Let page reflow
 
-    // Focus the window before capture
-    await chrome.windows.update(win.id, { focused: true });
-    await sleep(300);
+  // Get page metrics for full page dimensions
+  const layoutMetrics = await sendDebugCommand(debugTarget, "Page.getLayoutMetrics");
+  const contentSize = layoutMetrics.contentSize || layoutMetrics.cssContentSize;
+  
+  const pageWidth = Math.ceil(contentSize.width);
+  const pageHeight = Math.ceil(contentSize.height);
+  
+  console.log("[RS] Full page dimensions:", pageWidth, "x", pageHeight);
 
-    // Get page metrics
-    const [{ result: metrics }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        scrollHeight: Math.max(
-          document.body.scrollHeight,
-          document.documentElement.scrollHeight,
-        ),
-        viewportHeight: window.innerHeight,
-        viewportWidth: window.innerWidth,
-        dpr: window.devicePixelRatio || 1,
-      }),
-    });
+  // Set viewport to full page size (with limits)
+  const maxHeight = 16384; // Chrome limit
+  const captureHeight = Math.min(pageHeight, maxHeight);
 
-    const { scrollHeight, viewportHeight, viewportWidth, dpr } = metrics;
+  await sendDebugCommand(debugTarget, "Emulation.setDeviceMetricsOverride", {
+    width: width,
+    height: captureHeight,
+    deviceScaleFactor: 1,
+    mobile: width < 768,
+  });
 
-    if (scrollHeight <= viewportHeight) {
-      // Page fits in one shot — no stitching needed
-      const dataUrl = await chrome.tabs.captureVisibleTab(win.id, {
-        format: "png",
-      });
-      return dataUrl;
-    }
+  await sleep(300);
 
-    // Scroll step: use 80% of viewport height to get overlap and avoid missing content
-    const step = Math.floor(viewportHeight * 0.9);
-    const partImages = [];
-    let scrollY = 0;
+  // Capture full page screenshot
+  const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
+    format: "png",
+    captureBeyondViewport: true,
+    clip: {
+      x: 0,
+      y: 0,
+      width: width,
+      height: captureHeight,
+      scale: 1,
+    },
+  });
 
-    // Disable fixed/sticky elements to avoid duplicate headers in stitched image
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        const style = document.createElement("style");
-        style.id = "__rs_fix__";
-        style.textContent = `
-          *[style*="position: fixed"], *[style*="position:fixed"],
-          *[style*="position: sticky"], *[style*="position:sticky"] {
-            position: static !important;
-          }
-        `;
-        // Also override computed styles
-        const all = document.querySelectorAll("*");
-        const stored = [];
-        all.forEach((el) => {
-          const cs = window.getComputedStyle(el);
-          if (cs.position === "fixed" || cs.position === "sticky") {
-            stored.push({ el, pos: el.style.position });
-            el.style.setProperty("position", "static", "important");
-          }
-        });
-        window.__rs_stored = stored;
-        document.head.appendChild(style);
-      },
-    });
-    await sleep(200);
-
-    // Capture each viewport-height strip
-    while (scrollY < scrollHeight) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: (y) => window.scrollTo(0, y),
-        args: [scrollY],
-      });
-      await sleep(280);
-
-      // Get actual scroll position (may be clamped at bottom)
-      const [{ result: actualY }] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => window.scrollY,
-      });
-
-      const dataUrl = await chrome.tabs.captureVisibleTab(win.id, {
-        format: "png",
-      });
-      const segmentHeight = Math.min(step, scrollHeight - actualY);
-      partImages.push({ dataUrl, y: actualY, height: segmentHeight });
-
-      if (actualY + viewportHeight >= scrollHeight) break;
-      scrollY += step;
-    }
-
-    // Restore original positions
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => {
-        if (window.__rs_stored) {
-          window.__rs_stored.forEach(({ el, pos }) => {
-            el.style.position = pos || "";
-          });
-        }
-        const st = document.getElementById("__rs_fix__");
-        if (st) st.remove();
-      },
-    });
-
-    // Stitch
-    const stitched = await stitchImages(
-      partImages,
-      viewportWidth,
-      scrollHeight,
-      viewportHeight,
-      dpr,
-    );
-    return stitched;
-  } finally {
-    await chrome.windows.remove(win.id).catch(() => {});
-  }
+  return "data:image/png;base64," + result.data;
 }
 
 /* ═══════════════════════════════════════════════════════
-   STITCH using OffscreenCanvas
+   CDP Helper
    ═══════════════════════════════════════════════════════ */
-async function stitchImages(
-  parts,
-  pageWidth,
-  totalHeight,
-  viewportHeight,
-  dpr,
-) {
-  // Clamp canvas size to avoid OOM on very tall pages
-  const MAX_HEIGHT = 16000;
-  const canvasW = Math.round(pageWidth * dpr);
-  const canvasH = Math.min(Math.round(totalHeight * dpr), MAX_HEIGHT);
-
-  const canvas = new OffscreenCanvas(canvasW, canvasH);
-  const ctx = canvas.getContext("2d");
-
-  for (const part of parts) {
-    const blob = await (await fetch(part.dataUrl)).blob();
-    const bmp = await createImageBitmap(blob);
-
-    // How many CSS pixels this strip covers
-    const stripCssH = part.height;
-    // In canvas pixels
-    const stripCanvasH = Math.round(stripCssH * dpr);
-    const destY = Math.round(part.y * dpr);
-
-    // Only draw the top stripCssH rows of the captured bitmap
-    // (bmp.height may be taller if viewport has extra content below)
-    const srcH = Math.min(bmp.height, Math.round(viewportHeight * dpr));
-    const drawH = Math.min(stripCanvasH, canvasH - destY);
-    if (drawH <= 0) {
-      bmp.close();
-      continue;
-    }
-
-    ctx.drawImage(bmp, 0, 0, bmp.width, srcH, 0, destY, canvasW, drawH);
-    bmp.close();
-  }
-
-  const blob = await canvas.convertToBlob({ type: "image/png" });
-  return blobToDataUrl(blob);
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(reader.result);
-    reader.readAsDataURL(blob);
+function sendDebugCommand(target, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(target, method, params, (result) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(result);
+      }
+    });
   });
 }
 
 /* ═══════════════════════════════════════════════════════
    HELPERS
    ═══════════════════════════════════════════════════════ */
-function waitForTabLoad(tabId, timeout = 15000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(); // proceed even if load stalled
-    }, timeout);
-
-    function listener(id, info) {
-      if (id === tabId && info.status === "complete") {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    }
-
-    chrome.tabs.onUpdated.addListener(listener);
-
-    // Check if already loaded
-    chrome.tabs.get(tabId, (tab) => {
-      if (tab && tab.status === "complete") {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    });
-  });
-}
-
 function downloadImage(dataUrl, pageUrl, width) {
   const hostname = safeHostname(pageUrl);
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
