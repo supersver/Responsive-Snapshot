@@ -224,10 +224,14 @@ async function captureFullPageCDP(debugTarget, width) {
     });
     await sleep(200);
 
-    const result = await sendDebugCommand(debugTarget, "Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: false,
-    });
+    const result = await sendDebugCommand(
+      debugTarget,
+      "Page.captureScreenshot",
+      {
+        format: "png",
+        captureBeyondViewport: false,
+      },
+    );
 
     const remainingHeight = captureHeight - scrollY;
     const thisStripHeight = Math.min(stripHeight, remainingHeight);
@@ -238,7 +242,12 @@ async function captureFullPageCDP(debugTarget, width) {
       height: thisStripHeight,
     });
 
-    console.log("[RS] Captured strip at y:", scrollY, "height:", thisStripHeight);
+    console.log(
+      "[RS] Captured strip at y:",
+      scrollY,
+      "height:",
+      thisStripHeight,
+    );
 
     scrollY += stripHeight;
   }

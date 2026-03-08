@@ -322,6 +322,21 @@ function drawText(ctx, a) {
   ctx.fillText(a.text, a.x, a.y);
 }
 
+function drawBlurPreview(ctx, x1, y1, x2, y2) {
+  const rx = Math.min(x1, x2),
+    ry = Math.min(y1, y2);
+  const rw = Math.abs(x2 - x1),
+    rh = Math.abs(y2 - y1);
+  if (rw < 2 || rh < 2) return;
+  ctx.strokeStyle = "#888888";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 5]);
+  ctx.strokeRect(rx, ry, rw, rh);
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(128, 128, 128, 0.3)";
+  ctx.fillRect(rx, ry, rw, rh);
+}
+
 function drawBlur(ctx, x1, y1, x2, y2) {
   const rx = Math.min(x1, x2),
     ry = Math.min(y1, y2);
